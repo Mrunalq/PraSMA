@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
+import altair as alt
 from datetime import date, timedelta
 
 st.set_page_config(page_title="PraSMA Dashboard", layout="wide")
@@ -48,18 +49,41 @@ def calc_emi(loan_amount, interest_rate, start_date, end_date):
 
 
 def calc_dpd_asof(eval_date, start_date, emi_due, history):
-    """DPD as of a given date, using only history entries up to that date."""
+    """
+    DPD as of a given date, using a cumulative FIFO ledger.
+
+    Instead of checking each month's payment in isolation, we track the
+    running total paid vs. running total due. This lets a lump-sum payment
+    (e.g. paying 4 months' EMI at once after missing 4 months) correctly
+    clear the whole backlog, rather than only being credited to the month
+    it was logged against.
+
+    "Fully paid installments" = how many EMIs the cumulative payment total
+    can fully cover, in FIFO order (oldest first). The next installment
+    after that is the oldest unpaid one, and DPD counts from its due date.
+    """
     due_day = start_date.day
-    oldest_unpaid_date = None
-    sorted_history = sorted(history, key=lambda r: r["month_date"])
-    for record in sorted_history:
-        if record["month_date"] > eval_date:
-            continue
-        if record["amount_paid"] < emi_due - TOLERANCE:
-            if oldest_unpaid_date is None:
-                oldest_unpaid_date = date(record["month_date"].year, record["month_date"].month, due_day)
-    if oldest_unpaid_date is None:
+    sorted_history = sorted(
+        (r for r in history if r["month_date"] <= eval_date),
+        key=lambda r: r["month_date"],
+    )
+    if not sorted_history or emi_due <= 0:
         return 0
+
+    cumulative_paid = sum(r["amount_paid"] for r in sorted_history)
+    # How many installments does the cumulative payment fully cover (FIFO)?
+    fully_paid_count = int((cumulative_paid + TOLERANCE) // emi_due)
+
+    if fully_paid_count >= len(sorted_history):
+        # Entire logged backlog is covered by payments so far
+        return 0
+
+    oldest_unpaid_record = sorted_history[fully_paid_count]
+    oldest_unpaid_date = date(
+        oldest_unpaid_record["month_date"].year,
+        oldest_unpaid_record["month_date"].month,
+        due_day,
+    )
     return max((eval_date - oldest_unpaid_date).days, 0)
 
 
@@ -72,15 +96,41 @@ def payment_status(paid, due):
         return "Full"
 
 
+def is_loan_closed(acc):
+    """Loan is fully repaid once cumulative payments cover total EMI x tenure owed."""
+    total_payable = acc["emi_due"] * acc["tenure_months"]
+    if total_payable <= 0:
+        return False
+    cumulative_paid = sum(r["amount_paid"] for r in acc["history"])
+    return cumulative_paid + TOLERANCE >= total_payable
+
+
 def build_monthly_snapshot(acc):
     """For each month in history, compute DPD-as-of and stage-as-of that point in time."""
     sorted_history = sorted(acc["history"], key=lambda r: r["month_date"])
+    emi_due = acc["emi_due"]
     snapshots = []
+    cumulative_paid = 0.0
     for i, record in enumerate(sorted_history):
         history_so_far = sorted_history[: i + 1]
         dpd = calc_dpd_asof(record["month_date"], acc["start_date"], acc["emi_due"], history_so_far)
         stage = get_stage(dpd)
         ratio = record["amount_paid"] / acc["emi_due"] if acc["emi_due"] else 0
+
+        # Which due-month(s) does this payment actually clear, in FIFO order?
+        cumulative_before = cumulative_paid
+        cumulative_paid += record["amount_paid"]
+        fully_before = int((cumulative_before + TOLERANCE) // emi_due) if emi_due else 0
+        fully_after = int((cumulative_paid + TOLERANCE) // emi_due) if emi_due else 0
+        newly_cleared = list(range(fully_before, min(fully_after, i + 1)))
+        if newly_cleared:
+            covered = ", ".join(sorted_history[j]["month_date"].strftime("%b %Y") for j in newly_cleared)
+            month_status = f"Done: {covered}"
+        elif fully_before <= i:
+            month_status = f"Pending: {sorted_history[fully_before]['month_date'].strftime('%b %Y')}"
+        else:
+            month_status = "Advance (ahead of schedule)"
+
         snapshots.append({
             "month_date": record["month_date"],
             "amount_paid": record["amount_paid"],
@@ -88,6 +138,7 @@ def build_monthly_snapshot(acc):
             "status": payment_status(record["amount_paid"], acc["emi_due"]),
             "dpd": dpd,
             "stage": stage,
+            "month_status": month_status,
         })
     return snapshots
 
@@ -222,6 +273,11 @@ with tab1:
         c3.metric("Interest Rate", f"{acc['interest_rate']}%")
         c4.metric("Loan Amount", f"₹{acc['loan_amount']:,}")
 
+        if is_loan_closed(acc):
+            total_payable = acc["emi_due"] * acc["tenure_months"]
+            total_paid = sum(r["amount_paid"] for r in acc["history"])
+            st.success(f"✅ Loan Fully Repaid — Account Closed  (₹{total_paid:,.0f} paid of ₹{total_payable:,.0f} owed)")
+
         st.subheader("Current Risk Status")
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Stage", stage)
@@ -237,16 +293,32 @@ with tab1:
         st.dataframe(feat_df, use_container_width=True)
 
         if len(snapshots) > 1:
-            st.subheader("DPD Trend")
-            trend_df = pd.DataFrame(
-                {"DPD": [s["dpd"] for s in snapshots]},
-                index=pd.to_datetime([s["month_date"] for s in snapshots]),
+            st.subheader("DPD Trend (Month-wise)")
+            # "Mon YYYY" labels, spaced evenly per month. We must pass an
+            # explicit chronological sort order to Altair — otherwise it
+            # sorts the labels alphabetically (e.g. "Aug" before "Jul"),
+            # which scrambles the timeline even though the data itself
+            # is in the correct order.
+            month_labels = [s["month_date"].strftime("%b %Y") for s in snapshots]
+            trend_df = pd.DataFrame({"Month": month_labels, "DPD": [s["dpd"] for s in snapshots]})
+
+            chart = (
+                alt.Chart(trend_df)
+                .mark_line(point=True)
+                .encode(
+                    x=alt.X("Month:N", sort=month_labels, title=None),
+                    y=alt.Y("DPD:Q", title="DPD (days)"),
+                    tooltip=["Month", "DPD"],
+                )
+                .properties(height=300)
             )
-            st.line_chart(trend_df)
+            st.altair_chart(chart, use_container_width=True)
 
         if snapshots:
             st.subheader("Payment History")
-            hist_df = pd.DataFrame(snapshots)[["month_date", "amount_paid", "status", "dpd", "stage"]]
+            hist_df = pd.DataFrame(snapshots)[
+                ["month_date", "amount_paid", "status", "month_status", "dpd", "stage"]
+            ].rename(columns={"month_status": "Month Status"})
             st.dataframe(hist_df, use_container_width=True)
 
 with tab2:
@@ -268,7 +340,18 @@ with tab2:
                 "Risk % (placeholder)": round(risk_pct * 100, 1),
                 "Priority Score": priority_score,
                 "Loan Amount": acc["loan_amount"],
+                "Loan Status": "Closed" if is_loan_closed(acc) else "Active",
             })
 
         risk_df = pd.DataFrame(rows).sort_values("Priority Score", ascending=False)
-        st.dataframe(risk_df, use_container_width=True)
+
+        stage_options = ["All Stages"] + list(STAGE_WEIGHT.keys())
+        selected_stage = st.selectbox("Filter by Stage", stage_options)
+
+        if selected_stage != "All Stages":
+            display_df = risk_df[risk_df["Stage"] == selected_stage]
+            st.caption(f"Showing {len(display_df)} account(s) in {selected_stage}")
+        else:
+            display_df = risk_df
+
+        st.dataframe(display_df, use_container_width=True)
