@@ -26,12 +26,41 @@ RANDOM_STATE = 42
 def main():
     df = pd.read_csv("prasma_training_data.csv")
 
-    X = df[FEATURE_ORDER].to_numpy()
-    y = df["label_worsens_next_month"].to_numpy()
-    groups = df["account_id"].to_numpy()
+    # ---- Target-leakage guard ----
+    # archetype, sub_pattern, and current_stage are GENERATOR METADATA — they
+    # tag which synthetic behavior pattern produced each row, assigned by
+    # generate_data.py after simulating an account's FULL 24-month
+    # trajectory. A real bank account, observed live, has no equivalent tag —
+    # nothing tells you at Month 3 that "this account was built to simulate
+    # gradual_decline." If these columns were ever fed to the model, they'd
+    # act as a near-perfect, disguised copy of the label (since the label
+    # itself was derived from the same simulated trajectory), producing
+    # excellent-looking evaluation metrics that are meaningless in practice.
+    # account_id is excluded from X for a related but separate reason: it's
+    # an identifier, not a behavioral signal, and is used below ONLY for
+    # GroupShuffleSplit (a different leakage fix — preventing one account's
+    # months from appearing in both train and test).
+    #
+    # FEATURE_ORDER (from core.py) already excludes all of these by being an
+    # explicit whitelist, not "everything except the label" — but that
+    # correctness previously depended on FEATURE_ORDER never being edited
+    # carelessly. This assertion makes it a hard failure instead of a silent
+    # assumption, and the explicit drop below makes the intent unmistakable
+    # to anyone reading this script later.
+    LEAKY_COLUMNS = {"archetype", "sub_pattern", "current_stage", "account_id", "label_worsens_next_month"}
+    assert set(FEATURE_ORDER).isdisjoint(LEAKY_COLUMNS), (
+        "FEATURE_ORDER must never include generator metadata or the label — "
+        f"found overlap: {set(FEATURE_ORDER) & LEAKY_COLUMNS}"
+    )
+
+    df_model = df.drop(columns=["archetype", "sub_pattern", "current_stage"])
+    X = df_model[FEATURE_ORDER].to_numpy()
+    y = df_model["label_worsens_next_month"].to_numpy()
+    groups = df_model["account_id"].to_numpy()  # used only for GroupShuffleSplit below, never as a feature
 
     print(f"Total rows: {len(df)}  |  Unique accounts: {df['account_id'].nunique()}")
-    print(f"Overall positive rate: {y.mean():.3f}\n")
+    print(f"Overall positive rate: {y.mean():.3f}")
+    print(f"Confirmed excluded from training: {sorted(LEAKY_COLUMNS - {'label_worsens_next_month'})}\n")
 
     # Split by ACCOUNT, not by row — every row from one account goes entirely
     # into train or entirely into test, never both. This is the fix for the
