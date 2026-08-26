@@ -18,6 +18,42 @@ STAGE_WEIGHT = {"Standard": 0.5, "SMA-0": 1.0, "SMA-1": 1.5, "SMA-2": 2.0, "NPA"
 TOLERANCE = 5.0  # ₹5 buffer — adjust if your team wants a different threshold
 
 
+def format_inr(amount, decimals=0):
+    """Indian digit grouping, e.g. 500000 -> '₹5,00,000', 1000000 -> '₹10,00,000'."""
+    if amount is None:
+        return "-"
+    is_negative = amount < 0
+    amount = abs(amount)
+    if decimals > 0:
+        whole = int(amount)
+        frac = round((amount - whole) * (10 ** decimals))
+        frac_str = str(frac).zfill(decimals)
+    else:
+        whole = int(round(amount))
+        frac_str = None
+
+    s = str(whole)
+    if len(s) <= 3:
+        grouped = s
+    else:
+        last3, rest = s[-3:], s[:-3]
+        parts = []
+        while len(rest) > 2:
+            parts.insert(0, rest[-2:])
+            rest = rest[:-2]
+        if rest:
+            parts.insert(0, rest)
+        grouped = ",".join(parts) + "," + last3
+
+    result = f"₹{grouped}" + (f".{frac_str}" if frac_str else "")
+    return f"-{result}" if is_negative else result
+
+
+def format_date_in(d):
+    """dd/mm/yyyy display format."""
+    return d.strftime("%d/%m/%Y") if d else "-"
+
+
 # ---------- Core calculation functions ----------
 
 def get_stage(dpd):
@@ -57,7 +93,7 @@ def calc_dpd_asof(eval_date, start_date, emi_due, history):
     (e.g. paying 4 months' EMI at once after missing 4 months) correctly
     clear the whole backlog, rather than only being credited to the month
     it was logged against.
-
+    
     "Fully paid installments" = how many EMIs the cumulative payment total
     can fully cover, in FIFO order (oldest first). The next installment
     after that is the oldest unpaid one, and DPD counts from its due date.
@@ -206,8 +242,8 @@ st.sidebar.header("Add New Account")
 new_id = st.sidebar.text_input("Account ID / Borrower Name")
 loan_amount = st.sidebar.number_input("Loan Amount (₹)", min_value=1000, value=500000, step=1000)
 interest_rate = st.sidebar.slider("Interest Rate (% per annum)", min_value=8.0, max_value=14.0, value=10.5, step=0.1)
-start_date = st.sidebar.date_input("Loan Start Date", value=date.today() - timedelta(days=180))
-end_date = st.sidebar.date_input("Loan End Date", value=date.today() + timedelta(days=365 * 4))
+start_date = st.sidebar.date_input("Loan Start Date", value=date.today() - timedelta(days=180), format="DD/MM/YYYY")
+end_date = st.sidebar.date_input("Loan End Date", value=date.today() + timedelta(days=365 * 4), format="DD/MM/YYYY")
 
 if st.sidebar.button("Create Account"):
     if not new_id:
@@ -227,7 +263,7 @@ if st.sidebar.button("Create Account"):
             "emi_due": emi_due,
             "history": [],
         }
-        st.sidebar.success(f"Account {new_id} created — EMI ₹{emi_due:,.0f}/month, tenure {tenure_months} months")
+        st.sidebar.success(f"Account {new_id} created — EMI {format_inr(emi_due, decimals=2)}/month, tenure {tenure_months} months")
 
 # ---------- Sidebar: Recurring inputs (2 fields, every month) ----------
 
@@ -236,7 +272,7 @@ st.sidebar.header("Add Monthly Payment")
 
 if st.session_state.accounts:
     pay_id = st.sidebar.selectbox("Select Account", list(st.session_state.accounts.keys()))
-    month_date = st.sidebar.date_input("Payment Date", value=date.today())
+    month_date = st.sidebar.date_input("Payment Date", value=date.today(), format="DD/MM/YYYY")
     amount_paid = st.sidebar.number_input("Amount Paid (₹)", min_value=0, value=0)
 
     if st.sidebar.button("Submit Payment"):
@@ -268,15 +304,15 @@ with tab1:
 
         st.subheader("Auto-Calculated Loan Terms")
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("EMI Due", f"₹{acc['emi_due']:,.0f}")
+        c1.metric("EMI Due", format_inr(acc['emi_due'], decimals=2))
         c2.metric("Tenure", f"{acc['tenure_months']} months")
         c3.metric("Interest Rate", f"{acc['interest_rate']}%")
-        c4.metric("Loan Amount", f"₹{acc['loan_amount']:,}")
+        c4.metric("Loan Amount", format_inr(acc['loan_amount']))
 
         if is_loan_closed(acc):
             total_payable = acc["emi_due"] * acc["tenure_months"]
             total_paid = sum(r["amount_paid"] for r in acc["history"])
-            st.success(f"✅ Loan Fully Repaid — Account Closed  (₹{total_paid:,.0f} paid of ₹{total_payable:,.0f} owed)")
+            st.success(f"✅ Loan Fully Repaid — Account Closed  ({format_inr(total_paid)} paid of {format_inr(total_payable)} owed)")
 
         st.subheader("Current Risk Status")
         c1, c2, c3, c4 = st.columns(4)
@@ -319,6 +355,8 @@ with tab1:
             hist_df = pd.DataFrame(snapshots)[
                 ["month_date", "amount_paid", "status", "month_status", "dpd", "stage"]
             ].rename(columns={"month_status": "Month Status"})
+            hist_df["month_date"] = hist_df["month_date"].apply(format_date_in)
+            hist_df["amount_paid"] = hist_df["amount_paid"].apply(lambda v: format_inr(v, decimals=2))
             st.dataframe(hist_df, use_container_width=True)
 
 with tab2:
@@ -339,7 +377,7 @@ with tab2:
                 "DPD": dpd,
                 "Risk % (placeholder)": round(risk_pct * 100, 1),
                 "Priority Score": priority_score,
-                "Loan Amount": acc["loan_amount"],
+                "Loan Amount": format_inr(acc["loan_amount"]),
                 "Loan Status": "Closed" if is_loan_closed(acc) else "Active",
             })
 
