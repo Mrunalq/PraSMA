@@ -2,7 +2,16 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import altair as alt
+import pickle
+import os
 from datetime import date, timedelta
+
+from core import (
+    format_inr, format_date_in, get_stage, months_between, add_months,
+    calc_emi, calc_dpd_asof, payment_status, is_loan_closed,
+    build_monthly_snapshot, compute_10_features, FEATURE_ORDER,
+    MIN_MONTHS_FOR_PREDICTION,
+)
 
 st.set_page_config(page_title="PraSMA Dashboard", layout="wide")
 
@@ -23,221 +32,39 @@ WATCHLIST_LABEL = {
 }
 WATCHLIST_STAGES = list(WATCHLIST_LABEL.keys())  # NPA excluded — handled as a separate reference table, not a predictive watchlist
 
-# Rupee tolerance for "underpaid" checks — real EMIs have paise (e.g. ₹10,264.90)
-# but people naturally type rounded amounts (e.g. ₹10,264). Without this, a
-# genuinely full payment gets flagged as short by a few paise and DPD starts
-# counting from that month forever, even though nothing was actually missed.
-TOLERANCE = 5.0  # ₹5 buffer — adjust if your team wants a different threshold
+
+MODEL_PATH = "model.pkl"
 
 
-def format_inr(amount, decimals=0):
-    """Indian digit grouping, e.g. 500000 -> '₹5,00,000', 1000000 -> '₹10,00,000'."""
-    if amount is None:
-        return "-"
-    is_negative = amount < 0
-    amount = abs(amount)
-    if decimals > 0:
-        whole = int(amount)
-        frac = round((amount - whole) * (10 ** decimals))
-        frac_str = str(frac).zfill(decimals)
-    else:
-        whole = int(round(amount))
-        frac_str = None
-
-    s = str(whole)
-    if len(s) <= 3:
-        grouped = s
-    else:
-        last3, rest = s[-3:], s[:-3]
-        parts = []
-        while len(rest) > 2:
-            parts.insert(0, rest[-2:])
-            rest = rest[:-2]
-        if rest:
-            parts.insert(0, rest)
-        grouped = ",".join(parts) + "," + last3
-
-    result = f"₹{grouped}" + (f".{frac_str}" if frac_str else "")
-    return f"-{result}" if is_negative else result
+@st.cache_resource
+def load_model():
+    """Loads model.pkl once per app session and reuses it — without this,
+    Streamlit would re-read the pickle file from disk on every single
+    interaction (every button click triggers a full script rerun)."""
+    if not os.path.exists(MODEL_PATH):
+        return None, None, None
+    with open(MODEL_PATH, "rb") as f:
+        data = pickle.load(f)
+    return data["model"], data["scaler"], data["feature_order"]
 
 
-def format_date_in(d):
-    """dd/mm/yyyy display format."""
-    return d.strftime("%d/%m/%Y") if d else "-"
-
-
-# ---------- Core calculation functions ----------
-
-def get_stage(dpd):
-    if dpd == 0:
-        return "Standard"
-    elif dpd <= 30:
-        return "SMA-0"
-    elif dpd <= 60:
-        return "SMA-1"
-    elif dpd <= 90:
-        return "SMA-2"
-    else:
-        return "NPA"
-
-
-def months_between(start_date, end_date):
-    return (end_date.year - start_date.year) * 12 + (end_date.month - start_date.month)
-
-
-def calc_emi(loan_amount, interest_rate, start_date, end_date):
-    n = months_between(start_date, end_date)
-    n = max(n, 1)
-    r = (interest_rate / 12) / 100
-    if r == 0:
-        emi = loan_amount / n
-    else:
-        emi = loan_amount * r * (1 + r) ** n / ((1 + r) ** n - 1)
-    return round(emi, 2), n
-
-
-def calc_dpd_asof(eval_date, start_date, emi_due, history):
-    """
-    DPD as of a given date, using a cumulative FIFO ledger.
-
-    Instead of checking each month's payment in isolation, we track the
-    running total paid vs. running total due. This lets a lump-sum payment
-    (e.g. paying 4 months' EMI at once after missing 4 months) correctly
-    clear the whole backlog, rather than only being credited to the month
-    it was logged against.
-    
-    "Fully paid installments" = how many EMIs the cumulative payment total
-    can fully cover, in FIFO order (oldest first). The next installment
-    after that is the oldest unpaid one, and DPD counts from its due date.
-    """
-    due_day = start_date.day
-    sorted_history = sorted(
-        (r for r in history if r["month_date"] <= eval_date),
-        key=lambda r: r["month_date"],
-    )
-    if not sorted_history or emi_due <= 0:
-        return 0
-
-    cumulative_paid = sum(r["amount_paid"] for r in sorted_history)
-    # How many installments does the cumulative payment fully cover (FIFO)?
-    fully_paid_count = int((cumulative_paid + TOLERANCE) // emi_due)
-
-    if fully_paid_count >= len(sorted_history):
-        # Entire logged backlog is covered by payments so far
-        return 0
-
-    oldest_unpaid_record = sorted_history[fully_paid_count]
-    oldest_unpaid_date = date(
-        oldest_unpaid_record["month_date"].year,
-        oldest_unpaid_record["month_date"].month,
-        due_day,
-    )
-    return max((eval_date - oldest_unpaid_date).days, 0)
-
-
-def payment_status(paid, due):
-    if paid <= 0:
-        return "Missed"
-    elif paid < due - TOLERANCE:
-        return "Partial"
-    else:
-        return "Full"
-
-
-def is_loan_closed(acc):
-    """Loan is fully repaid once cumulative payments cover total EMI x tenure owed."""
-    total_payable = acc["emi_due"] * acc["tenure_months"]
-    if total_payable <= 0:
-        return False
-    cumulative_paid = sum(r["amount_paid"] for r in acc["history"])
-    return cumulative_paid + TOLERANCE >= total_payable
-
-
-def build_monthly_snapshot(acc):
-    """For each month in history, compute DPD-as-of and stage-as-of that point in time."""
-    sorted_history = sorted(acc["history"], key=lambda r: r["month_date"])
-    emi_due = acc["emi_due"]
-    snapshots = []
-    cumulative_paid = 0.0
-    for i, record in enumerate(sorted_history):
-        history_so_far = sorted_history[: i + 1]
-        dpd = calc_dpd_asof(record["month_date"], acc["start_date"], acc["emi_due"], history_so_far)
-        stage = get_stage(dpd)
-        ratio = record["amount_paid"] / acc["emi_due"] if acc["emi_due"] else 0
-
-        # Which due-month(s) does this payment actually clear, in FIFO order?
-        cumulative_before = cumulative_paid
-        cumulative_paid += record["amount_paid"]
-        fully_before = int((cumulative_before + TOLERANCE) // emi_due) if emi_due else 0
-        fully_after = int((cumulative_paid + TOLERANCE) // emi_due) if emi_due else 0
-        newly_cleared = list(range(fully_before, min(fully_after, i + 1)))
-        if newly_cleared:
-            covered = ", ".join(sorted_history[j]["month_date"].strftime("%b %Y") for j in newly_cleared)
-            month_status = f"Done: {covered}"
-        elif fully_before <= i:
-            month_status = f"Pending: {sorted_history[fully_before]['month_date'].strftime('%b %Y')}"
-        else:
-            month_status = "Advance (ahead of schedule)"
-
-        snapshots.append({
-            "month_date": record["month_date"],
-            "amount_paid": record["amount_paid"],
-            "payment_ratio": ratio,
-            "status": payment_status(record["amount_paid"], acc["emi_due"]),
-            "dpd": dpd,
-            "stage": stage,
-            "month_status": month_status,
-        })
-    return snapshots
-
-
-def compute_8_features(acc, snapshots):
-    """Compute the 8 rolling behavioral features from the last 6 months of snapshots."""
-    window = snapshots[-6:]  # last up to 6 months
-
-    if len(window) == 0:
-        return {
-            "dpd_trend": 0.0, "payment_ratio_trend": 0.0, "partial_payment_count": 0,
-            "missed_payment_count": 0, "payment_volatility": 0.0, "prior_sma_transitions": 0,
-            "account_age_months": months_between(acc["start_date"], date.today()),
-            "outstanding_principal_ratio": 1.0,
-        }
-
-    dpd_values = [s["dpd"] for s in window]
-    ratio_values = [s["payment_ratio"] for s in window]
-    x = np.arange(len(window))
-
-    dpd_trend = float(np.polyfit(x, dpd_values, 1)[0]) if len(window) > 1 else 0.0
-    payment_ratio_trend = float(np.polyfit(x, ratio_values, 1)[0]) if len(window) > 1 else 0.0
-    partial_count = sum(1 for s in window if s["status"] == "Partial")
-    missed_count = sum(1 for s in window if s["status"] == "Missed")
-    volatility = float(np.var(ratio_values))
-
-    all_stages = [s["stage"] for s in snapshots]
-    transitions = sum(1 for i in range(1, len(all_stages)) if all_stages[i] != all_stages[i - 1])
-
-    account_age = months_between(acc["start_date"], date.today())
-
-    total_paid = sum(s["amount_paid"] for s in snapshots)
-    outstanding_ratio = max(0.0, (acc["loan_amount"] - total_paid) / acc["loan_amount"])
-
-    return {
-        "dpd_trend": round(dpd_trend, 3),
-        "payment_ratio_trend": round(payment_ratio_trend, 3),
-        "partial_payment_count": partial_count,
-        "missed_payment_count": missed_count,
-        "payment_volatility": round(volatility, 4),
-        "prior_sma_transitions": transitions,
-        "account_age_months": account_age,
-        "outstanding_principal_ratio": round(outstanding_ratio, 3),
-    }
+def real_risk_score(features):
+    """Runs the trained Logistic Regression (train_model.py) on this
+    account's 10 features. Returns None if model.pkl isn't present yet,
+    so the dashboard can fall back gracefully instead of crashing."""
+    model, scaler, feature_order = load_model()
+    if model is None:
+        return None
+    x = np.array([[features[f] for f in feature_order]])
+    x_scaled = scaler.transform(x)
+    return round(float(model.predict_proba(x_scaled)[0][1]), 3)
 
 
 def placeholder_risk_score(features):
     """
-    TEMPORARY stand-in until Phase 6's trained Logistic Regression model
-    (model.pkl) is wired in. Rough weighted rule, NOT the real model.
-    Swap this function's body for model.predict_proba(...) later.
+    Fallback ONLY — used if model.pkl hasn't been generated yet (i.e.
+    train_model.py hasn't been run). Rough weighted rule, NOT the real
+    model. Once model.pkl exists, real_risk_score() is used instead.
     """
     score = 0.0
     score += min(features["dpd_trend"] / 10, 1.0) * 0.35 if features["dpd_trend"] > 0 else 0
@@ -248,53 +75,134 @@ def placeholder_risk_score(features):
     return round(min(score, 1.0), 3)
 
 
+def get_risk_score(features):
+    """Single entry point the rest of the app calls — tries the real
+    trained model first, falls back to the placeholder rule if model.pkl
+    isn't present, and tells you (once) which one is active."""
+    score = real_risk_score(features)
+    if score is not None:
+        return score, True  # True = using the real trained model
+    return placeholder_risk_score(features), False  # False = fallback rule
+
+
+@st.cache_data(show_spinner=False)
+def _compute_account_metrics_cached(loan_amount, start_date, emi_due, tenure_months, history_tuple):
+    """
+    The expensive per-account work (DPD/stage engine + 10 features + model
+    inference), cached and keyed on the account's actual data.
+
+    WHY THIS EXISTS: without it, every account in the portfolio gets fully
+    recomputed on EVERY rerun — and Streamlit reruns the entire script on
+    every single interaction anywhere in the app, not just changes to that
+    account. With enough accounts, this made the app feel laggy, and it got
+    worse with every account added since the cost is per-account x every
+    rerun. Caching on (loan terms, history) means an account whose data
+    hasn't changed since the last rerun is served instantly from cache —
+    only the account that actually just changed gets recomputed.
+
+    history_tuple must be a hashable, order-stable representation of the
+    account's payment history (a tuple of (month_date, amount_paid) tuples)
+    — plain dicts/lists aren't hashable, so the caller converts first.
+    """
+    acc = {
+        "loan_amount": loan_amount,
+        "start_date": start_date,
+        "emi_due": emi_due,
+        "tenure_months": tenure_months,
+        "history": [{"month_date": d, "amount_paid": a} for d, a in history_tuple],
+    }
+    snapshots = build_monthly_snapshot(acc)
+    features = compute_10_features(acc, snapshots)
+    if len(snapshots) >= MIN_MONTHS_FOR_PREDICTION:
+        risk_pct, using_real_model = get_risk_score(features)
+    else:
+        risk_pct, using_real_model = None, False
+    return snapshots, features, risk_pct, using_real_model
+
+
+def get_account_metrics(acc):
+    """Public wrapper — converts the account's history into the hashable
+    form the cache needs, then delegates to the cached computation."""
+    history_tuple = tuple((r["month_date"], r["amount_paid"]) for r in acc["history"])
+    return _compute_account_metrics_cached(
+        acc["loan_amount"], acc["start_date"], acc["emi_due"], acc["tenure_months"], history_tuple
+    )
+
+
 # ---------- Sidebar: Setup inputs (5 one-time fields) ----------
 
-st.sidebar.header("Add New Account")
-new_id = st.sidebar.text_input("Account ID / Borrower Name")
-loan_amount = st.sidebar.number_input("Loan Amount (₹)", min_value=1000, value=500000, step=1000)
-interest_rate = st.sidebar.slider("Interest Rate (% per annum)", min_value=8.0, max_value=14.0, value=10.5, step=0.1)
-start_date = st.sidebar.date_input("Loan Start Date", value=date.today() - timedelta(days=180), format="DD/MM/YYYY")
-end_date = st.sidebar.date_input("Loan End Date", value=date.today() + timedelta(days=365 * 4), format="DD/MM/YYYY")
+with st.sidebar.expander("➕ Add New Account", expanded=(len(st.session_state.accounts) == 0)):
+    new_id = st.text_input("Account ID / Borrower Name")
+    loan_amount = st.number_input("Loan Amount (₹)", min_value=1000, value=500000, step=1000)
+    st.caption(f"= {format_inr(loan_amount)}")
+    interest_rate = st.slider("Interest Rate (% per annum)", min_value=8.0, max_value=14.0, value=10.5, step=0.1)
+    start_date = st.date_input("Loan Start Date", value=date.today() - timedelta(days=180), format="DD/MM/YYYY")
+    end_date = st.date_input("Loan End Date", value=date.today() + timedelta(days=365 * 4), format="DD/MM/YYYY")
 
-if st.sidebar.button("Create Account"):
-    if not new_id:
-        st.sidebar.error("Enter an Account ID")
-    elif new_id in st.session_state.accounts:
-        st.sidebar.error("This Account ID already exists")
-    elif end_date <= start_date:
-        st.sidebar.error("End Date must be after Start Date")
-    else:
-        emi_due, tenure_months = calc_emi(loan_amount, interest_rate, start_date, end_date)
-        st.session_state.accounts[new_id] = {
-            "loan_amount": loan_amount,
-            "interest_rate": interest_rate,
-            "start_date": start_date,
-            "end_date": end_date,
-            "tenure_months": tenure_months,
-            "emi_due": emi_due,
-            "history": [],
-        }
-        st.sidebar.success(f"Account {new_id} created — EMI {format_inr(emi_due, decimals=2)}/month, tenure {tenure_months} months")
+    if st.button("Create Account"):
+        if not new_id:
+            st.error("Enter an Account ID")
+        elif new_id in st.session_state.accounts:
+            st.error("This Account ID already exists")
+        elif end_date <= start_date:
+            st.error("End Date must be after Start Date")
+        else:
+            emi_due, tenure_months = calc_emi(loan_amount, interest_rate, start_date, end_date)
+            st.session_state.accounts[new_id] = {
+                "loan_amount": loan_amount,
+                "interest_rate": interest_rate,
+                "start_date": start_date,
+                "end_date": end_date,
+                "tenure_months": tenure_months,
+                "emi_due": emi_due,
+                "history": [],
+            }
+            st.success(f"Account {new_id} created — EMI {format_inr(emi_due, decimals=2)}/month, tenure {tenure_months} months")
 
 # ---------- Sidebar: Recurring inputs (2 fields, every month) ----------
 
 st.sidebar.markdown("---")
-st.sidebar.header("Add Monthly Payment")
 
-if st.session_state.accounts:
-    pay_id = st.sidebar.selectbox("Select Account", list(st.session_state.accounts.keys()))
-    month_date = st.sidebar.date_input("Payment Date", value=date.today(), format="DD/MM/YYYY")
-    amount_paid = st.sidebar.number_input("Amount Paid (₹)", min_value=0, value=0)
+with st.sidebar.expander("💰 Add Monthly Payment", expanded=True):
+    if st.session_state.accounts:
+        pay_id = st.selectbox("Select Account", list(st.session_state.accounts.keys()), key="pay_account_select")
+        acc_for_default = st.session_state.accounts[pay_id]
 
-    if st.sidebar.button("Submit Payment"):
-        st.session_state.accounts[pay_id]["history"].append({
-            "month_date": month_date,
-            "amount_paid": amount_paid,
-        })
-        st.sidebar.success("Payment recorded")
-else:
-    st.sidebar.info("Create an account first")
+        # First EMI is due one month after loan start — standard loan practice,
+        # never the same day as disbursement. Each subsequent default follows the
+        # same one-month cadence from whichever payment was logged most recently,
+        # so the field is always pre-filled with the NEXT expected due date
+        # instead of defaulting to today (which drifts from the real schedule).
+        if acc_for_default["history"]:
+            last_month_date = max(r["month_date"] for r in acc_for_default["history"])
+            default_payment_date = add_months(last_month_date, 1)
+        else:
+            default_payment_date = add_months(acc_for_default["start_date"], 1)
+
+        # IMPORTANT: key= is tied to (account, number of payments logged so far).
+        # Without this, Streamlit treats the date field as the SAME widget across
+        # reruns and keeps whatever value it last held — so after submitting a
+        # payment, the field would stay stuck instead of actually advancing to
+        # the next month. Changing the key each time a payment is added (or the
+        # selected account changes) forces Streamlit to re-initialize the widget
+        # fresh, so the auto-advance actually takes effect.
+        #
+        # If YOU manually pick a different date before submitting, that manual
+        # choice is exactly what gets saved — key= only controls what the field
+        # starts on, never overrides an active user selection.
+        widget_key = f"payment_date_{pay_id}_{len(acc_for_default['history'])}"
+        month_date = st.date_input("Payment Date", value=default_payment_date, format="DD/MM/YYYY", key=widget_key)
+        amount_paid = st.number_input("Amount Paid (₹)", min_value=0, value=0)
+
+        if st.button("Submit Payment"):
+            st.session_state.accounts[pay_id]["history"].append({
+                "month_date": month_date,
+                "amount_paid": amount_paid,
+            })
+            st.success("Payment recorded")
+            st.rerun()  # forces the date field to re-initialize immediately with the new next-month default
+    else:
+        st.info("Create an account first")
 
 # ---------- Main dashboard ----------
 
@@ -305,13 +213,12 @@ with tab1:
     if not st.session_state.accounts:
         st.info("No accounts yet. Add one from the sidebar.")
     else:
-        selected = st.selectbox("Choose Account", list(st.session_state.accounts.keys()))
+        selected = st.selectbox("Choose Account", list(st.session_state.accounts.keys()), key="detail_account_select")
         acc = st.session_state.accounts[selected]
-        snapshots = build_monthly_snapshot(acc)
+        snapshots, features, risk_pct, using_real_model = get_account_metrics(acc)
         dpd = snapshots[-1]["dpd"] if snapshots else 0
         stage = snapshots[-1]["stage"] if snapshots else "Standard"
-        features = compute_8_features(acc, snapshots)
-        risk_pct = placeholder_risk_score(features)
+        has_enough_history = len(snapshots) >= MIN_MONTHS_FOR_PREDICTION
 
         st.subheader("Auto-Calculated Loan Terms")
         c1, c2, c3, c4 = st.columns(4)
@@ -329,13 +236,44 @@ with tab1:
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Stage", stage)
         c2.metric("DPD", f"{dpd} days")
-        c3.metric("Risk % (placeholder)", f"{risk_pct * 100:.1f}%")
+        if has_enough_history:
+            risk_label = "Risk % (trained model)" if using_real_model else "Risk % (placeholder — run train_model.py)"
+            c3.metric(risk_label, f"{risk_pct * 100:.1f}%")
+        else:
+            c3.metric("Risk %", "—")
+            c3.caption(f"Need {MIN_MONTHS_FOR_PREDICTION}+ months of history ({len(snapshots)} so far)")
         c4.metric("Loan Status", "Closed" if is_loan_closed(acc) else "Active")
+
+        oldest_unpaid = snapshots[-1]["oldest_unpaid_date"] if snapshots else None
+        if oldest_unpaid:
+            st.info(
+                f"🔗 **Oldest Unpaid Installment: {oldest_unpaid.strftime('%B %Y')}** "
+                f"(due {format_date_in(oldest_unpaid)}) — DPD is counted from this exact date. "
+                f"It will only advance once cumulative payments fully clear it, per the FIFO ledger above."
+            )
+        elif snapshots:
+            st.success("✅ Fully caught up — no unpaid installment anchoring DPD right now.")
 
         if stage in ["SMA-1", "SMA-2", "NPA"]:
             st.warning(f"⚠️ Account has slipped to {stage}")
 
-        st.subheader("The 8 Behavioral Features (last 6 months)")
+        if snapshots:
+            latest = snapshots[-1]
+            st.subheader("Total Due vs. Total Paid (Till This Month)")
+            st.caption(
+                "This running comparison is what actually drives DPD and Stage above — "
+                "not any single month's payment in isolation. The oldest unpaid installment "
+                "only clears once cumulative payments catch up to cumulative dues."
+            )
+            d1, d2, d3 = st.columns(3)
+            d1.metric("Total Due Till Now", format_inr(latest["cumulative_due"], decimals=2))
+            d2.metric("Total Paid Till Now", format_inr(latest["cumulative_paid"], decimals=2))
+            if latest["shortfall_so_far"] > 0:
+                d3.metric("Shortfall", format_inr(latest["shortfall_so_far"], decimals=2), delta="behind", delta_color="inverse")
+            else:
+                d3.metric("Shortfall", "₹0.00 — Caught up", delta="on track", delta_color="normal")
+
+        st.subheader("The 10 Behavioral Features (last 6 months)")
         feat_df = pd.DataFrame([features]).T.rename(columns={0: "Value"})
         st.dataframe(feat_df, use_container_width=True)
 
@@ -364,32 +302,72 @@ with tab1:
         if snapshots:
             st.subheader("Payment History")
             hist_df = pd.DataFrame(snapshots)[
-                ["month_date", "amount_paid", "status", "month_status", "dpd", "stage"]
-            ].rename(columns={"month_status": "Month Status"})
+                ["month_date", "amount_paid", "status", "month_status", "dpd", "stage",
+                 "cumulative_due", "cumulative_paid", "shortfall_so_far", "oldest_unpaid_date"]
+            ].rename(columns={
+                "month_status": "Month Status",
+                "cumulative_due": "Total Due Till Now",
+                "cumulative_paid": "Total Paid Till Now",
+                "shortfall_so_far": "Shortfall",
+                "oldest_unpaid_date": "Oldest Unpaid Installment",
+            })
             hist_df["month_date"] = hist_df["month_date"].apply(format_date_in)
             hist_df["amount_paid"] = hist_df["amount_paid"].apply(lambda v: format_inr(v, decimals=2))
+            hist_df["Total Due Till Now"] = hist_df["Total Due Till Now"].apply(lambda v: format_inr(v, decimals=2))
+            hist_df["Total Paid Till Now"] = hist_df["Total Paid Till Now"].apply(lambda v: format_inr(v, decimals=2))
+            hist_df["Shortfall"] = hist_df["Shortfall"].apply(lambda v: format_inr(v, decimals=2))
+            hist_df["Oldest Unpaid Installment"] = hist_df["Oldest Unpaid Installment"].apply(
+                lambda v: v.strftime("%b %Y") if v else "— Caught up"
+            )
             st.dataframe(hist_df, use_container_width=True)
 
 with tab2:
     if not st.session_state.accounts:
         st.info("No accounts yet.")
     else:
+        _, model_active_check = get_risk_score({f: 0 for f in FEATURE_ORDER})
+        risk_col_label = "Risk %" if model_active_check else "Risk % (placeholder)"
+        if not model_active_check:
+            st.caption("⚠️ model.pkl not found — showing placeholder risk scores. Run train_model.py to enable the trained model.")
+
         rows = []
         for acc_id, acc in st.session_state.accounts.items():
-            snapshots = build_monthly_snapshot(acc)
+            snapshots, features, risk_pct, _ = get_account_metrics(acc)
             dpd = snapshots[-1]["dpd"] if snapshots else 0
             stage = snapshots[-1]["stage"] if snapshots else "Standard"
-            features = compute_8_features(acc, snapshots)
-            risk_pct = placeholder_risk_score(features)
+
+            if risk_pct is not None:
+                risk_display = round(risk_pct * 100, 1)
+            else:
+                risk_display = None  # renders as blank/NaN in the table — "not enough history yet"
+
+            # Repayment Trajectory — NOT used to change the NPA classification
+            # itself (RBI's rule is strictly "90+ days overdue," regardless of
+            # partial payments — that's the real regulation, not a modeling
+            # choice, and it's what makes Layer 1 auditable/defensible). This
+            # is a SEPARATE signal shown only in the NPA reference table, to
+            # distinguish an account still sending money each month from one
+            # that's gone completely dark — genuinely useful for how recovery
+            # teams prioritize NPA accounts, without touching the stage rule.
+            recent = snapshots[-3:] if len(snapshots) >= 3 else snapshots
+            recent_avg_ratio = (sum(s["payment_ratio"] for s in recent) / len(recent)) if recent else 0
+            if recent_avg_ratio >= 0.5:
+                trajectory = "🟢 Actively Repaying"
+            elif recent_avg_ratio > 0:
+                trajectory = "🟡 Token Payments Only"
+            else:
+                trajectory = "🔴 Dormant (no recent payment)"
+
             rows.append({
                 "Account": acc_id,
                 "Stage": stage,
                 "DPD": dpd,
                 "risk_pct_raw": risk_pct,  # kept as a float for sorting; not shown directly
-                "Risk % (placeholder)": round(risk_pct * 100, 1),
+                risk_col_label: risk_display,
                 "Loan Amount": acc["loan_amount"],  # kept numeric here for sorting the NPA table
                 "Loan Amount ": format_inr(acc["loan_amount"]),  # display copy
                 "Loan Status": "Closed" if is_loan_closed(acc) else "Active",
+                "Repayment Trajectory": trajectory,
             })
         risk_df = pd.DataFrame(rows)
 
@@ -403,7 +381,7 @@ with tab2:
             with tab:
                 stage_df = (
                     risk_df[risk_df["Stage"] == stage_key]
-                    .sort_values("risk_pct_raw", ascending=False)
+                    .sort_values("risk_pct_raw", ascending=False, na_position="last")
                     .drop(columns=["risk_pct_raw", "Loan Amount"])
                     .rename(columns={"Loan Amount ": "Loan Amount"})
                 )
@@ -420,18 +398,25 @@ with tab2:
         # matters for recovery prioritization, a different workflow from the
         # early-warning watchlists above. ----
         with watch_tabs[-1]:
+            TRAJECTORY_URGENCY = {"🔴 Dormant (no recent payment)": 0, "🟡 Token Payments Only": 1, "🟢 Actively Repaying": 2}
+            npa_slice = risk_df[risk_df["Stage"] == "NPA"].copy()
+            npa_slice["_urgency"] = npa_slice["Repayment Trajectory"].map(TRAJECTORY_URGENCY)
             npa_df = (
-                risk_df[risk_df["Stage"] == "NPA"]
-                .sort_values("Loan Amount", ascending=False)
-                .drop(columns=["risk_pct_raw", "Risk % (placeholder)", "Loan Amount"])
+                npa_slice
+                .sort_values(["_urgency", "Loan Amount"], ascending=[True, False])
+                .drop(columns=["risk_pct_raw", risk_col_label, "Loan Amount", "_urgency"])
                 .rename(columns={"Loan Amount ": "Loan Amount"})
             )
             if npa_df.empty:
                 st.caption("No accounts currently in NPA.")
             else:
                 st.caption(
-                    f"{len(npa_df)} account(s) already in NPA \u2014 handed off to recovery/legal, "
-                    "sorted by outstanding amount. Not part of the predictive watchlists above, "
-                    "since there's no further stage for the model to predict toward."
+                    f"{len(npa_df)} account(s) already in NPA \u2014 handed off to recovery/legal. "
+                    "Sorted by urgency first (dormant accounts on top, still-paying ones lower), "
+                    "then by outstanding amount. Not part of the predictive watchlists above, since "
+                    "NPA is RBI's terminal stage \u2014 there's no further stage for the model to predict "
+                    "toward. Repayment Trajectory does NOT affect the NPA classification itself (that's "
+                    "strictly DPD-based per RBI norms) \u2014 it only helps recovery teams prioritize WITHIN "
+                    "the NPA list."
                 )
                 st.dataframe(npa_df, use_container_width=True, hide_index=True)

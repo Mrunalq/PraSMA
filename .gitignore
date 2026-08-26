@@ -1,0 +1,38 @@
+# ---- Python ----
+__pycache__/
+*.pyc
+*.pyo
+.Python
+*.egg-info/
+
+# ---- Virtual environments ----
+.venv/
+venv/
+env/
+
+# ---- Generated data & trained model ----
+# These are build OUTPUTS (produced by generate_data.py / train_model.py),
+# not source files — regenerate them by re-running those two scripts rather
+# than committing large binary/data blobs to Git. Comment out any of these
+# if your team specifically WANTS them version-controlled (e.g. to guarantee
+# everyone demos with the exact same trained model without re-running
+# training on every machine).
+prasma_training_data.csv
+model.pkl
+
+# ---- Local database (once the SQLite persistence layer is added) ----
+*.db
+*.sqlite
+*.sqlite3
+
+# ---- Streamlit ----
+.streamlit/secrets.toml
+
+# ---- OS clutter ----
+.DS_Store
+Thumbs.db
+
+# ---- Editor/IDE ----
+.vscode/
+.idea/
+*.swp
