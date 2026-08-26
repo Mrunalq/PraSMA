@@ -9,7 +9,19 @@ st.set_page_config(page_title="PraSMA Dashboard", layout="wide")
 if "accounts" not in st.session_state:
     st.session_state.accounts = {}
 
-STAGE_WEIGHT = {"Standard": 0.5, "SMA-0": 1.0, "SMA-1": 1.5, "SMA-2": 2.0, "NPA": 2.5}
+# NOTE: priority_score (risk % x stage_severity_weight) was retired by design —
+# it let a stable-but-severe account (e.g. SMA-2, 30% risk) outrank an
+# unstable-but-early one (e.g. Standard, 95% risk), since severity and risk
+# got multiplied into one blended number and compared ACROSS stages.
+# Fix: rank accounts only WITHIN their current stage, purely by risk_probability.
+# Four separate watchlists, one per transition, replace the single blended list.
+WATCHLIST_LABEL = {
+    "Standard": "Standard \u2192 SMA-0 Watchlist",
+    "SMA-0": "SMA-0 \u2192 SMA-1 Watchlist",
+    "SMA-1": "SMA-1 \u2192 SMA-2 Watchlist",
+    "SMA-2": "SMA-2 \u2192 NPA Watchlist",
+}
+WATCHLIST_STAGES = list(WATCHLIST_LABEL.keys())  # NPA excluded — handled as a separate reference table, not a predictive watchlist
 
 # Rupee tolerance for "underpaid" checks — real EMIs have paise (e.g. ₹10,264.90)
 # but people naturally type rounded amounts (e.g. ₹10,264). Without this, a
@@ -300,7 +312,6 @@ with tab1:
         stage = snapshots[-1]["stage"] if snapshots else "Standard"
         features = compute_8_features(acc, snapshots)
         risk_pct = placeholder_risk_score(features)
-        priority_score = round(risk_pct * STAGE_WEIGHT[stage], 3)
 
         st.subheader("Auto-Calculated Loan Terms")
         c1, c2, c3, c4 = st.columns(4)
@@ -319,7 +330,7 @@ with tab1:
         c1.metric("Stage", stage)
         c2.metric("DPD", f"{dpd} days")
         c3.metric("Risk % (placeholder)", f"{risk_pct * 100:.1f}%")
-        c4.metric("Priority Score", priority_score)
+        c4.metric("Loan Status", "Closed" if is_loan_closed(acc) else "Active")
 
         if stage in ["SMA-1", "SMA-2", "NPA"]:
             st.warning(f"⚠️ Account has slipped to {stage}")
@@ -370,26 +381,57 @@ with tab2:
             stage = snapshots[-1]["stage"] if snapshots else "Standard"
             features = compute_8_features(acc, snapshots)
             risk_pct = placeholder_risk_score(features)
-            priority_score = round(risk_pct * STAGE_WEIGHT[stage], 3)
             rows.append({
                 "Account": acc_id,
                 "Stage": stage,
                 "DPD": dpd,
+                "risk_pct_raw": risk_pct,  # kept as a float for sorting; not shown directly
                 "Risk % (placeholder)": round(risk_pct * 100, 1),
-                "Priority Score": priority_score,
-                "Loan Amount": format_inr(acc["loan_amount"]),
+                "Loan Amount": acc["loan_amount"],  # kept numeric here for sorting the NPA table
+                "Loan Amount ": format_inr(acc["loan_amount"]),  # display copy
                 "Loan Status": "Closed" if is_loan_closed(acc) else "Active",
             })
+        risk_df = pd.DataFrame(rows)
 
-        risk_df = pd.DataFrame(rows).sort_values("Priority Score", ascending=False)
+        # ---- 4 stage-wise watchlists: each account appears in exactly ONE list —
+        # the one matching its CURRENT stage — ranked purely by risk % within
+        # that stage. No cross-stage comparison, so severity can never distort
+        # the ranking (see the note above STAGE_WEIGHT's removal). ----
+        watch_tabs = st.tabs([WATCHLIST_LABEL[s] for s in WATCHLIST_STAGES] + ["NPA (Reference)"])
 
-        stage_options = ["All Stages"] + list(STAGE_WEIGHT.keys())
-        selected_stage = st.selectbox("Filter by Stage", stage_options)
+        for tab, stage_key in zip(watch_tabs[:-1], WATCHLIST_STAGES):
+            with tab:
+                stage_df = (
+                    risk_df[risk_df["Stage"] == stage_key]
+                    .sort_values("risk_pct_raw", ascending=False)
+                    .drop(columns=["risk_pct_raw", "Loan Amount"])
+                    .rename(columns={"Loan Amount ": "Loan Amount"})
+                )
+                if stage_df.empty:
+                    st.caption(f"No accounts currently in {stage_key}.")
+                else:
+                    st.caption(f"{len(stage_df)} account(s) in {stage_key}, sorted by risk of moving to the next stage")
+                    st.dataframe(stage_df, use_container_width=True, hide_index=True)
 
-        if selected_stage != "All Stages":
-            display_df = risk_df[risk_df["Stage"] == selected_stage]
-            st.caption(f"Showing {len(display_df)} account(s) in {selected_stage}")
-        else:
-            display_df = risk_df
-
-        st.dataframe(display_df, use_container_width=True)
+        # ---- NPA accounts: NOT a predictive watchlist — there's no "next worse
+        # stage" for the model to score, so ranking by risk_probability doesn't
+        # apply here. Shown as a plain reference table instead, sorted by
+        # outstanding loan amount (highest exposure first) since that's what
+        # matters for recovery prioritization, a different workflow from the
+        # early-warning watchlists above. ----
+        with watch_tabs[-1]:
+            npa_df = (
+                risk_df[risk_df["Stage"] == "NPA"]
+                .sort_values("Loan Amount", ascending=False)
+                .drop(columns=["risk_pct_raw", "Risk % (placeholder)", "Loan Amount"])
+                .rename(columns={"Loan Amount ": "Loan Amount"})
+            )
+            if npa_df.empty:
+                st.caption("No accounts currently in NPA.")
+            else:
+                st.caption(
+                    f"{len(npa_df)} account(s) already in NPA \u2014 handed off to recovery/legal, "
+                    "sorted by outstanding amount. Not part of the predictive watchlists above, "
+                    "since there's no further stage for the model to predict toward."
+                )
+                st.dataframe(npa_df, use_container_width=True, hide_index=True)
