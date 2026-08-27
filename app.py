@@ -9,7 +9,7 @@ from datetime import date, timedelta
 from core import (
     format_inr, format_date_in, get_stage, months_between, add_months,
     calc_emi, calc_dpd_asof, payment_status, is_loan_closed,
-    build_monthly_snapshot, compute_10_features, FEATURE_ORDER,
+    build_monthly_snapshot, compute_9_features, FEATURE_ORDER,
     MIN_MONTHS_FOR_PREDICTION, TOLERANCE,
 )
 
@@ -32,7 +32,6 @@ WATCHLIST_LABEL = {
 }
 WATCHLIST_STAGES = list(WATCHLIST_LABEL.keys())  # NPA excluded — handled as a separate reference table, not a predictive watchlist
 
-
 MODEL_PATH = "model.pkl"
 
 
@@ -50,7 +49,7 @@ def load_model():
 
 def real_risk_score(features):
     """Runs the trained Logistic Regression (train_model.py) on this
-    account's 10 features. Returns None if model.pkl isn't present yet,
+    account's 9 features. Returns None if model.pkl isn't present yet,
     so the dashboard can fall back gracefully instead of crashing."""
     model, scaler, feature_order = load_model()
     if model is None:
@@ -68,7 +67,7 @@ def placeholder_risk_score(features):
     """
     score = 0.0
     score += min(features["dpd_trend"] / 10, 1.0) * 0.35 if features["dpd_trend"] > 0 else 0
-    score += (features["missed_payment_count"] / 6) * 0.30
+    score += (features["consecutive_missed_months"] / 6) * 0.30  # replaces missed_payment_count, removed for collinearity
     score += (features["partial_payment_count"] / 6) * 0.15
     score += min(features["payment_volatility"] * 2, 1.0) * 0.10
     score += min(features["prior_sma_transitions"] / 4, 1.0) * 0.10
@@ -88,7 +87,7 @@ def get_risk_score(features):
 @st.cache_data(show_spinner=False)
 def _compute_account_metrics_cached(loan_amount, start_date, emi_due, tenure_months, history_tuple):
     """
-    The expensive per-account work (DPD/stage engine + 10 features + model
+    The expensive per-account work (DPD/stage engine + 9 features + model
     inference), cached and keyed on the account's actual data.
 
     WHY THIS EXISTS: without it, every account in the portfolio gets fully
@@ -112,7 +111,7 @@ def _compute_account_metrics_cached(loan_amount, start_date, emi_due, tenure_mon
         "history": [{"month_date": d, "amount_paid": a} for d, a in history_tuple],
     }
     snapshots = build_monthly_snapshot(acc)
-    features = compute_10_features(acc, snapshots)
+    features = compute_9_features(acc, snapshots)
     if len(snapshots) >= MIN_MONTHS_FOR_PREDICTION:
         risk_pct, using_real_model = get_risk_score(features)
     else:
@@ -239,8 +238,8 @@ with st.sidebar.expander("💰 Add Monthly Payment", expanded=True):
         st.info("Create an account first")
 
 # ---------- Main dashboard ----------
-
 st.title("PraSMA — Risk Dashboard")
+
 tab1, tab2 = st.tabs(["Account Detail", "Portfolio Risk List"])
 
 with tab1:
@@ -248,7 +247,7 @@ with tab1:
         st.info("No accounts yet. Add one from the sidebar.")
     else:
         selected = st.session_state["active_account"]
-        st.caption(f"Showing: **{selected}**  (change via 🏦 Active Account in the sidebar)")
+        st.caption(f"Showing: **{selected}** (change via 🏦 Active Account in the sidebar)")
         acc = st.session_state.accounts[selected]
         snapshots, features, risk_pct, using_real_model = get_account_metrics(acc)
         dpd = snapshots[-1]["dpd"] if snapshots else 0
@@ -308,7 +307,7 @@ with tab1:
             else:
                 d3.metric("Shortfall", "₹0.00 — Caught up", delta="on track", delta_color="normal")
 
-        st.subheader("The 10 Behavioral Features (last 6 months)")
+        st.subheader("The 9 Behavioral Features (last 6 months)")
         feat_df = pd.DataFrame([features]).T.rename(columns={0: "Value"})
         st.dataframe(feat_df, use_container_width=True)
 
@@ -321,7 +320,6 @@ with tab1:
             # is in the correct order.
             month_labels = [s["month_date"].strftime("%b %Y") for s in snapshots]
             trend_df = pd.DataFrame({"Month": month_labels, "DPD": [s["dpd"] for s in snapshots]})
-
             chart = (
                 alt.Chart(trend_df)
                 .mark_line(point=True)

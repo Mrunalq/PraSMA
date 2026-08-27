@@ -78,6 +78,19 @@ def main():
     X_train, X_test = X[train_idx], X[test_idx]
     y_train, y_test = y[train_idx], y[test_idx]
 
+    # ---- Feature scaling ----
+    # The 9 features live on very different scales (e.g. max_dpd_last_6m
+    # ranges 0-121, while payment_volatility ranges 0.0-0.25). Logistic
+    # Regression's optimizer (gradient-based) and its coefficient magnitudes
+    # are scale-sensitive — left unscaled, a large-magnitude feature like
+    # max_dpd_last_6m would dominate purely because of its numeric range,
+    # not because it's more predictive, while a genuinely informative but
+    # small-scale feature like payment_volatility could be effectively
+    # ignored. StandardScaler is fit ONLY on X_train (fit_transform) and
+    # then reused, unchanged, on X_test (transform only, never re-fit) —
+    # fitting on test data would leak test-set statistics into training,
+    # the same category of mistake as the account-level split issue above,
+    # just applied to feature scaling instead of row selection.
     scaler = StandardScaler()
     X_train_scaled = scaler.fit_transform(X_train)
     X_test_scaled = scaler.transform(X_test)

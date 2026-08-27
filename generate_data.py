@@ -4,13 +4,18 @@ PraSMA Synthetic Data Generator
 Generates labeled training data by simulating account payment histories
 across 4 main archetypes, each split into randomized-severity sub-patterns
 (11 total), then running every synthetic account through the SAME
-build_monthly_snapshot() / compute_10_features() functions the live
+build_monthly_snapshot() / compute_9_features() functions the live
 dashboard uses (imported from core.py) — never a reimplemented copy.
 
 Output: prasma_training_data.csv — one row per (account, month) with the
-10 features, the label (did the account worsen the FOLLOWING month?), and
+9 features, the label (did the account worsen the FOLLOWING month?), and
 an account_id column, which GroupShuffleSplit needs at training time to
 avoid splitting one account's months across both train and test sets.
+
+NOTE: originally 10 features. missed_payment_count was removed after being
+found 100% collinear with consecutive_missed_months (verified empirically —
+correlation 1.0, zero differing rows across all 40,911 rows). See core.py's
+compute_9_features() docstring for the full root-cause explanation.
 """
 
 import random
@@ -19,7 +24,7 @@ import pandas as pd
 from datetime import date
 
 from core import (
-    calc_emi, build_monthly_snapshot, compute_10_features,
+    calc_emi, build_monthly_snapshot, compute_9_features,
     FEATURE_ORDER, MIN_MONTHS_FOR_PREDICTION, stage_rank,
 )
 
@@ -168,7 +173,7 @@ def build_training_table():
                 if current_stage_i == "NPA":
                     continue
 
-                feats = compute_10_features(acc, snapshots, as_of_index=i)
+                feats = compute_9_features(acc, snapshots, as_of_index=i)
                 current_rank = stage_rank(current_stage_i)
                 next_rank = stage_rank(snapshots[i + 1]["stage"])
                 label = 1 if next_rank > current_rank else 0

@@ -20,7 +20,19 @@ FEATURE_ORDER = [
     "dpd_trend",
     "payment_ratio_trend",
     "partial_payment_count",
-    "missed_payment_count",
+    # "missed_payment_count" removed — verified 100% collinear with
+    # consecutive_missed_months across all 40,911 training rows (correlation
+    # = 1.0, zero differing rows). Root cause: in this data generator, a
+    # "Missed" month only ever occurs at the tail of the decline archetypes'
+    # trajectory, so the total-miss-count and the trailing-streak-count are
+    # structurally forced to agree. Kept consecutive_missed_months instead —
+    # it's the strictly more specific signal (a run of consecutive misses is
+    # a stronger warning than the same count spread out), and subsumes
+    # missed_payment_count as a special case whenever misses are consecutive,
+    # which is always true here anyway. Perfectly duplicate features make
+    # Logistic Regression's individual coefficients non-identifiable (only
+    # their SUM is determined by the data), which would have undermined the
+    # explainability bar chart's credibility.
     "payment_volatility",
     "prior_sma_transitions",
     "account_age_months",
@@ -239,12 +251,28 @@ def build_monthly_snapshot(acc):
     return snapshots
 
 
-# ---------- Feature engineering (the 10 parameters) ----------
+# ---------- Feature engineering (the 9 parameters) ----------
 
-def compute_10_features(acc, snapshots, as_of_index=None):
+def compute_9_features(acc, snapshots, as_of_index=None):
     """
-    Compute the 10 rolling behavioral features using snapshots[:as_of_index+1]
+    Compute the 9 rolling behavioral features using snapshots[:as_of_index+1]
     — i.e. history up to and including that month ONLY.
+
+    Originally 10 features. missed_payment_count was removed after being
+    found 100% collinear with consecutive_missed_months (correlation = 1.0,
+    zero differing rows across 40,911 training rows) — verified empirically,
+    not assumed. Root cause: in this data generator, a "Missed" month only
+    ever occurs at the tail of the decline archetypes' trajectory, so the
+    total-miss-count and the trailing-streak-count are structurally forced
+    to agree. Perfectly duplicate features make Logistic Regression's
+    individual coefficients non-identifiable — only their SUM is determined
+    by the data, so the specific split the solver lands on is arbitrary and
+    solver-dependent, undermining the explainability bar chart's credibility.
+    consecutive_missed_months was kept over missed_payment_count because it's
+    the strictly more specific signal (a consecutive run is a stronger
+    warning than the same count spread out) and subsumes the dropped
+    feature as a special case whenever misses are consecutive — which, per
+    the root cause above, is always true in this generator anyway.
 
     as_of_index=None (the default, used by the live dashboard) means "use
     everything in `snapshots`" — correct there, since live account history
@@ -261,9 +289,9 @@ def compute_10_features(acc, snapshots, as_of_index=None):
     was fixed with GroupShuffleSplit.
     """
     if not snapshots:
-        return {f: (0.0 if f not in ("partial_payment_count", "missed_payment_count",
-                                      "prior_sma_transitions", "account_age_months",
-                                      "consecutive_missed_months", "max_dpd_last_6m") else 0)
+        return {f: (0.0 if f not in ("partial_payment_count", "prior_sma_transitions",
+                                      "account_age_months", "consecutive_missed_months",
+                                      "max_dpd_last_6m") else 0)
                 for f in FEATURE_ORDER}
 
     if as_of_index is None:
@@ -280,7 +308,6 @@ def compute_10_features(acc, snapshots, as_of_index=None):
     dpd_trend = float(np.polyfit(x, dpd_values, 1)[0]) if len(window) > 1 else 0.0
     payment_ratio_trend = float(np.polyfit(x, ratio_values, 1)[0]) if len(window) > 1 else 0.0
     partial_count = sum(1 for s in window if s["status"] == "Partial")
-    missed_count = sum(1 for s in window if s["status"] == "Missed")
     volatility = float(np.var(ratio_values))
 
     # Only stages up to eval point — NOT the account's full future trajectory
@@ -292,7 +319,6 @@ def compute_10_features(acc, snapshots, as_of_index=None):
     total_paid_so_far = sum(s["amount_paid"] for s in history_so_far)
     outstanding_ratio = max(0.0, (acc["loan_amount"] - total_paid_so_far) / acc["loan_amount"]) if acc["loan_amount"] else 1.0
 
-    # --- The 2 additional parameters ---
     consecutive_missed = 0
     for s in reversed(window):
         if s["status"] == "Missed":
@@ -306,7 +332,6 @@ def compute_10_features(acc, snapshots, as_of_index=None):
         "dpd_trend": round(dpd_trend, 3),
         "payment_ratio_trend": round(payment_ratio_trend, 3),
         "partial_payment_count": partial_count,
-        "missed_payment_count": missed_count,
         "payment_volatility": round(volatility, 4),
         "prior_sma_transitions": transitions,
         "account_age_months": account_age,
