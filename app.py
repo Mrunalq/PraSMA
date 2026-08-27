@@ -10,7 +10,7 @@ from core import (
     format_inr, format_date_in, get_stage, months_between, add_months,
     calc_emi, calc_dpd_asof, payment_status, is_loan_closed,
     build_monthly_snapshot, compute_10_features, FEATURE_ORDER,
-    MIN_MONTHS_FOR_PREDICTION,
+    MIN_MONTHS_FOR_PREDICTION, TOLERANCE,
 )
 
 st.set_page_config(page_title="PraSMA Dashboard", layout="wide")
@@ -157,15 +157,27 @@ with st.sidebar.expander("➕ Add New Account", expanded=(len(st.session_state.a
                 "emi_due": emi_due,
                 "history": [],
             }
+            st.session_state["active_account"] = new_id  # newly created account becomes the active one
             st.success(f"Account {new_id} created — EMI {format_inr(emi_due, decimals=2)}/month, tenure {tenure_months} months")
 
-# ---------- Sidebar: Recurring inputs (2 fields, every month) ----------
-
+# ---------- Sidebar: single shared "Active Account" selector ----------
+# FIX: previously the payment form and the Account Detail tab each had their
+# OWN separate st.selectbox (different `key`s), so picking an account in one
+# never updated the other. Paying against Account 2 in the sidebar left the
+# main dashboard still showing whichever account the detail-tab dropdown
+# happened to be on (often Account 1, untouched since creation) -- looking
+# like the dashboard "switched back". One shared selector, used everywhere,
+# fixes that at the source.
 st.sidebar.markdown("---")
+if st.session_state.accounts:
+    acc_ids = list(st.session_state.accounts.keys())
+    if "active_account" not in st.session_state or st.session_state["active_account"] not in acc_ids:
+        st.session_state["active_account"] = acc_ids[0]
+    st.sidebar.selectbox("🏦 Active Account", acc_ids, key="active_account")
 
 with st.sidebar.expander("💰 Add Monthly Payment", expanded=True):
     if st.session_state.accounts:
-        pay_id = st.selectbox("Select Account", list(st.session_state.accounts.keys()), key="pay_account_select")
+        pay_id = st.session_state["active_account"]
         acc_for_default = st.session_state.accounts[pay_id]
 
         # First EMI is due one month after loan start — standard loan practice,
@@ -179,28 +191,50 @@ with st.sidebar.expander("💰 Add Monthly Payment", expanded=True):
         else:
             default_payment_date = add_months(acc_for_default["start_date"], 1)
 
-        # IMPORTANT: key= is tied to (account, number of payments logged so far).
-        # Without this, Streamlit treats the date field as the SAME widget across
-        # reruns and keeps whatever value it last held — so after submitting a
-        # payment, the field would stay stuck instead of actually advancing to
-        # the next month. Changing the key each time a payment is added (or the
-        # selected account changes) forces Streamlit to re-initialize the widget
-        # fresh, so the auto-advance actually takes effect.
-        #
-        # If YOU manually pick a different date before submitting, that manual
-        # choice is exactly what gets saved — key= only controls what the field
-        # starts on, never overrides an active user selection.
-        widget_key = f"payment_date_{pay_id}_{len(acc_for_default['history'])}"
-        month_date = st.date_input("Payment Date", value=default_payment_date, format="DD/MM/YYYY", key=widget_key)
-        amount_paid = st.number_input("Amount Paid (₹)", min_value=0, value=0)
+        # --- FIX (Problem 3): loan already fully repaid -> no more payments ---
+        # Checked BEFORE rendering the input fields, using the account's state
+        # as it stood before this submission, so the payment that actually
+        # completes the loan is still accepted (it's the one that flips
+        # is_loan_closed to True) -- only payments AFTER that are blocked.
+        if is_loan_closed(acc_for_default):
+            st.success("🎉 Loan Completed — this account is fully repaid. No further payments can be added.")
+        else:
+            # IMPORTANT: key= is tied to (account, number of payments logged so far).
+            # Without this, Streamlit treats the date field as the SAME widget across
+            # reruns and keeps whatever value it last held — so after submitting a
+            # payment, the field would stay stuck instead of actually advancing to
+            # the next month. Changing the key each time a payment is added (or the
+            # selected account changes) forces Streamlit to re-initialize the widget
+            # fresh, so the auto-advance actually takes effect.
+            #
+            # If YOU manually pick a different date before submitting, that manual
+            # choice is exactly what gets saved — key= only controls what the field
+            # starts on, never overrides an active user selection.
+            widget_key = f"payment_date_{pay_id}_{len(acc_for_default['history'])}"
+            month_date = st.date_input("Payment Date", value=default_payment_date, format="DD/MM/YYYY", key=widget_key)
+            amount_paid = st.number_input("Amount Paid (₹)", min_value=0, value=0)
 
-        if st.button("Submit Payment"):
-            st.session_state.accounts[pay_id]["history"].append({
-                "month_date": month_date,
-                "amount_paid": amount_paid,
-            })
-            st.success("Payment recorded")
-            st.rerun()  # forces the date field to re-initialize immediately with the new next-month default
+            if st.button("Submit Payment"):
+                # --- FIX (Problem 2): block re-paying a month that's already Full ---
+                # Sums any prior payments already logged for this exact month_date.
+                # If that total already meets/exceeds the EMI, reject the new entry.
+                # (A month that was only Partially paid can still be topped up.)
+                already_paid_this_month = sum(
+                    r["amount_paid"] for r in acc_for_default["history"]
+                    if r["month_date"] == month_date
+                )
+                if already_paid_this_month + TOLERANCE >= acc_for_default["emi_due"]:
+                    st.error(
+                        f"⚠️ {month_date.strftime('%b %Y')} EMI is already fully paid "
+                        f"({format_inr(already_paid_this_month)}). Cannot log another full payment for this month."
+                    )
+                else:
+                    st.session_state.accounts[pay_id]["history"].append({
+                        "month_date": month_date,
+                        "amount_paid": amount_paid,
+                    })
+                    st.success("Payment recorded")
+                    st.rerun()  # forces the date field to re-initialize immediately with the new next-month default
     else:
         st.info("Create an account first")
 
@@ -213,7 +247,8 @@ with tab1:
     if not st.session_state.accounts:
         st.info("No accounts yet. Add one from the sidebar.")
     else:
-        selected = st.selectbox("Choose Account", list(st.session_state.accounts.keys()), key="detail_account_select")
+        selected = st.session_state["active_account"]
+        st.caption(f"Showing: **{selected}**  (change via 🏦 Active Account in the sidebar)")
         acc = st.session_state.accounts[selected]
         snapshots, features, risk_pct, using_real_model = get_account_metrics(acc)
         dpd = snapshots[-1]["dpd"] if snapshots else 0

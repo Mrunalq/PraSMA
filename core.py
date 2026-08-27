@@ -145,11 +145,12 @@ def _oldest_unpaid_info(eval_date, start_date, emi_due, history):
         return 0, None
 
     oldest_unpaid_record = sorted_history[fully_paid_count]
-    oldest_unpaid_date = date(
-        oldest_unpaid_record["month_date"].year,
-        oldest_unpaid_record["month_date"].month,
-        due_day,
-    )
+    # month_date was already generated via add_months(), which safely clamps
+    # the day for short months (e.g. Jan 31 -> Feb 28/29). Re-deriving it here
+    # with a raw date(year, month, due_day) call used to crash with
+    # "ValueError: day is out of range for month" whenever due_day (from
+    # start_date) didn't exist in that month. Just reuse the valid date.
+    oldest_unpaid_date = oldest_unpaid_record["month_date"]
     dpd = max((eval_date - oldest_unpaid_date).days, 0)
     return dpd, oldest_unpaid_date
 
