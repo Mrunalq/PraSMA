@@ -339,3 +339,48 @@ def compute_9_features(acc, snapshots, as_of_index=None):
         "consecutive_missed_months": consecutive_missed,
         "max_dpd_last_6m": max_dpd_6m,
     }
+
+
+def validate_payment(acc, month_date, amount_paid):
+    """
+    Checks a proposed payment against two rules before it's allowed to be
+    recorded:
+
+      1. It must not push cumulative payments past the loan's total
+         obligation (emi_due x tenure_months) — prevents a stray extra
+         digit from silently overpaying the loan. CONFIRMED MISSING bug:
+         without this, a payment of any size (e.g. accidentally typing
+         999999999) was accepted with no error at all, even on a loan
+         that only owed a few lakh rupees.
+      2. It must not be logged against a month that's already fully paid
+         — the database's UNIQUE(account_id, month_date) constraint also
+         catches this as a backup, but checking here first gives a clean
+         error message instead of a raw sqlite3.IntegrityError.
+
+    Returns (is_valid, error_message, remaining_payable). error_message is
+    None when is_valid is True. remaining_payable is always returned (even
+    when invalid, and even when amount_paid is 0) so callers can display
+    "remaining balance" BEFORE the user submits, not just after rejecting.
+    """
+    total_payable = acc["emi_due"] * acc["tenure_months"]
+    cumulative_paid_so_far = sum(r["amount_paid"] for r in acc["history"])
+    remaining_payable = max(0.0, round(total_payable - cumulative_paid_so_far, 2))
+
+    if amount_paid > remaining_payable + TOLERANCE:
+        return (
+            False,
+            f"This payment exceeds the remaining loan balance. Maximum you can enter right now: {remaining_payable:.2f}",
+            remaining_payable,
+        )
+
+    already_paid_this_month = sum(
+        r["amount_paid"] for r in acc["history"] if r["month_date"] == month_date
+    )
+    if already_paid_this_month + TOLERANCE >= acc["emi_due"]:
+        return (
+            False,
+            f"{month_date.strftime('%b %Y')} EMI is already fully paid ({already_paid_this_month:.2f}). Cannot log another full payment for this month.",
+            remaining_payable,
+        )
+
+    return True, None, remaining_payable

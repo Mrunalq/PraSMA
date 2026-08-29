@@ -12,7 +12,7 @@ from core import (
     format_inr, format_date_in, get_stage, months_between, add_months,
     calc_emi, calc_dpd_asof, payment_status, is_loan_closed,
     build_monthly_snapshot, compute_9_features, FEATURE_ORDER,
-    MIN_MONTHS_FOR_PREDICTION, TOLERANCE,
+    MIN_MONTHS_FOR_PREDICTION, TOLERANCE, validate_payment,
 )
 
 st.set_page_config(page_title="PraSMA Dashboard", layout="wide")
@@ -253,27 +253,30 @@ with st.sidebar.expander("💰 Add Monthly Payment", expanded=True):
             # starts on, never overrides an active user selection.
             widget_key = f"payment_date_{pay_id}_{len(acc_for_default['history'])}"
             month_date = st.date_input("Payment Date", value=default_payment_date, format="DD/MM/YYYY", key=widget_key)
+
+            # Shown BEFORE submission, using amount_paid=0 just to compute the
+            # ceiling — the caption is purely informational at this point.
+            _, _, remaining_payable = validate_payment(acc_for_default, month_date, 0)
+            st.caption(f"Remaining balance on this loan: {format_inr(remaining_payable, decimals=2)}")
+
             amount_paid = st.number_input("Amount Paid (₹)", min_value=0, value=0)
 
             if st.button("Submit Payment"):
-                # --- FIX (Problem 2): block re-paying a month that's already Full ---
-                # Sums any prior payments already logged for this exact month_date.
-                # If that total already meets/exceeds the EMI, reject the new entry.
-                # (A month that was only Partially paid can still be topped up.)
-                already_paid_this_month = sum(
-                    r["amount_paid"] for r in acc_for_default["history"]
-                    if r["month_date"] == month_date
-                )
-                if already_paid_this_month + TOLERANCE >= acc_for_default["emi_due"]:
-                    st.error(
-                        f"⚠️ {month_date.strftime('%b %Y')} EMI is already fully paid "
-                        f"({format_inr(already_paid_this_month)}). Cannot log another full payment for this month."
-                    )
+                # --- FIX: block a payment that exceeds the loan's remaining
+                # balance, AND block re-paying an already-fully-paid month —
+                # both checked here via the single shared validate_payment()
+                # (core.py), before ever touching the database. Confirmed via
+                # testing: without this check, an arbitrarily large payment
+                # (e.g. 999999999 on a loan owing only ~3.76 lakh) was
+                # previously accepted with no error at all. ---
+                is_valid, error_message, _ = validate_payment(acc_for_default, month_date, amount_paid)
+                if not is_valid:
+                    st.error(f"⚠️ {error_message}")
                 else:
                     try:
                         database.add_payment(pay_id, month_date, amount_paid)
                     except sqlite3.IntegrityError:
-                        # Backup for the already_paid_this_month check above —
+                        # Backup for the validate_payment() check above —
                         # payments has UNIQUE(account_id, month_date), so the
                         # database itself refuses a second row for the same month.
                         st.error(
@@ -357,7 +360,7 @@ with tab1:
 
         st.subheader("The 9 Behavioral Features (last 6 months)")
         feat_df = pd.DataFrame([features]).T.rename(columns={0: "Value"})
-        st.dataframe(feat_df, use_container_width=True)
+        st.dataframe(feat_df, width='stretch')
 
         if len(snapshots) > 1:
             st.subheader("DPD Trend (Month-wise)")
@@ -378,7 +381,7 @@ with tab1:
                 )
                 .properties(height=300)
             )
-            st.altair_chart(chart, use_container_width=True)
+            st.altair_chart(chart, width='stretch')
 
         if snapshots:
             st.subheader("Payment History")
@@ -400,7 +403,7 @@ with tab1:
             hist_df["Oldest Unpaid Installment"] = hist_df["Oldest Unpaid Installment"].apply(
                 lambda v: v.strftime("%b %Y") if v else "— Caught up"
             )
-            st.dataframe(hist_df, use_container_width=True)
+            st.dataframe(hist_df, width='stretch')
 
 with tab2:
     if not all_account_ids:
@@ -471,7 +474,7 @@ with tab2:
                     st.caption(f"No accounts currently in {stage_key}.")
                 else:
                     st.caption(f"{len(stage_df)} account(s) in {stage_key}, sorted by risk of moving to the next stage")
-                    st.dataframe(stage_df, use_container_width=True, hide_index=True)
+                    st.dataframe(stage_df, width='stretch', hide_index=True)
 
         # ---- NPA accounts: NOT a predictive watchlist — there's no "next worse
         # stage" for the model to score, so ranking by risk_probability doesn't
@@ -501,4 +504,4 @@ with tab2:
                     "strictly DPD-based per RBI norms) \u2014 it only helps recovery teams prioritize WITHIN "
                     "the NPA list."
                 )
-                st.dataframe(npa_df, use_container_width=True, hide_index=True)
+                st.dataframe(npa_df, width='stretch', hide_index=True)
