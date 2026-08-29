@@ -4,8 +4,10 @@ import numpy as np
 import altair as alt
 import pickle
 import os
+import sqlite3
 from datetime import date, timedelta
 
+import database
 from core import (
     format_inr, format_date_in, get_stage, months_between, add_months,
     calc_emi, calc_dpd_asof, payment_status, is_loan_closed,
@@ -15,8 +17,10 @@ from core import (
 
 st.set_page_config(page_title="PraSMA Dashboard", layout="wide")
 
-if "accounts" not in st.session_state:
-    st.session_state.accounts = {}
+# NOTE (DB migration): account data now lives in SQLite (database.py), not
+# st.session_state. "active_account" (which account is currently selected)
+# stays in session_state on purpose — that's UI state, not data, and needs
+# to persist across reruns exactly the way it did before.
 
 # NOTE: priority_score (risk % x stage_severity_weight) was retired by design —
 # it let a stable-but-severe account (e.g. SMA-2, 30% risk) outrank an
@@ -128,9 +132,46 @@ def get_account_metrics(acc):
     )
 
 
+def load_account(account_id):
+    """Reads one account + its full payment history from SQLite (database.py)
+    and reshapes it into the exact dict shape core.py already expects:
+    {loan_amount, interest_rate, start_date, end_date, tenure_months,
+    emi_due, history: [{month_date, amount_paid}, ...]}.
+
+    database.py stores dates as ISO strings ("2024-01-31") — this is the one
+    place that converts them back into real date objects, so every other
+    function in this file (and everything in core.py) keeps working with
+    actual `date` objects exactly as it did when data lived in memory.
+    Returns None if the account_id doesn't exist.
+    """
+    row = database.get_account(account_id)
+    if not row:
+        return None
+    payments = database.get_payments(account_id)
+    return {
+        "loan_amount": row["loan_amount"],
+        "interest_rate": row["interest_rate"],
+        "start_date": date.fromisoformat(row["start_date"]),
+        "end_date": date.fromisoformat(row["end_date"]),
+        "tenure_months": row["tenure_months"],
+        "emi_due": row["emi_due"],
+        "history": [
+            {"month_date": date.fromisoformat(p["month_date"]), "amount_paid": p["amount_paid"]}
+            for p in payments
+        ],
+    }
+
+
+# Streamlit reruns this whole script on every interaction, so the account
+# list is fetched fresh once per rerun and reused everywhere below —
+# avoids repeated database round-trips within the same rerun, while still
+# always reflecting the latest data (a fresh fetch happens on every rerun).
+all_account_ids = [a["account_id"] for a in database.get_all_accounts()]
+
+
 # ---------- Sidebar: Setup inputs (5 one-time fields) ----------
 
-with st.sidebar.expander("➕ Add New Account", expanded=(len(st.session_state.accounts) == 0)):
+with st.sidebar.expander("➕ Add New Account", expanded=(len(all_account_ids) == 0)):
     new_id = st.text_input("Account ID / Borrower Name")
     loan_amount = st.number_input("Loan Amount (₹)", min_value=1000, value=500000, step=1000)
     st.caption(f"= {format_inr(loan_amount)}")
@@ -141,23 +182,25 @@ with st.sidebar.expander("➕ Add New Account", expanded=(len(st.session_state.a
     if st.button("Create Account"):
         if not new_id:
             st.error("Enter an Account ID")
-        elif new_id in st.session_state.accounts:
+        elif new_id in all_account_ids:
             st.error("This Account ID already exists")
         elif end_date <= start_date:
             st.error("End Date must be after Start Date")
         else:
             emi_due, tenure_months = calc_emi(loan_amount, interest_rate, start_date, end_date)
-            st.session_state.accounts[new_id] = {
-                "loan_amount": loan_amount,
-                "interest_rate": interest_rate,
-                "start_date": start_date,
-                "end_date": end_date,
-                "tenure_months": tenure_months,
-                "emi_due": emi_due,
-                "history": [],
-            }
-            st.session_state["active_account"] = new_id  # newly created account becomes the active one
-            st.success(f"Account {new_id} created — EMI {format_inr(emi_due, decimals=2)}/month, tenure {tenure_months} months")
+            try:
+                database.create_account(
+                    new_id, loan_amount, interest_rate, start_date, end_date, tenure_months, emi_due,
+                )
+            except sqlite3.IntegrityError:
+                # Backup for the all_account_ids check above (e.g. a stale list
+                # within the same rerun) — accounts.account_id is a PRIMARY KEY,
+                # so the database itself refuses a second row with the same id.
+                st.error("This Account ID already exists")
+            else:
+                st.session_state["active_account"] = new_id  # newly created account becomes the active one
+                st.success(f"Account {new_id} created — EMI {format_inr(emi_due, decimals=2)}/month, tenure {tenure_months} months")
+                st.rerun()  # refresh all_account_ids so the new account shows up immediately everywhere
 
 # ---------- Sidebar: single shared "Active Account" selector ----------
 # FIX: previously the payment form and the Account Detail tab each had their
@@ -168,16 +211,15 @@ with st.sidebar.expander("➕ Add New Account", expanded=(len(st.session_state.a
 # like the dashboard "switched back". One shared selector, used everywhere,
 # fixes that at the source.
 st.sidebar.markdown("---")
-if st.session_state.accounts:
-    acc_ids = list(st.session_state.accounts.keys())
-    if "active_account" not in st.session_state or st.session_state["active_account"] not in acc_ids:
-        st.session_state["active_account"] = acc_ids[0]
-    st.sidebar.selectbox("🏦 Active Account", acc_ids, key="active_account")
+if all_account_ids:
+    if "active_account" not in st.session_state or st.session_state["active_account"] not in all_account_ids:
+        st.session_state["active_account"] = all_account_ids[0]
+    st.sidebar.selectbox("🏦 Active Account", all_account_ids, key="active_account")
 
 with st.sidebar.expander("💰 Add Monthly Payment", expanded=True):
-    if st.session_state.accounts:
+    if all_account_ids:
         pay_id = st.session_state["active_account"]
-        acc_for_default = st.session_state.accounts[pay_id]
+        acc_for_default = load_account(pay_id)
 
         # First EMI is due one month after loan start — standard loan practice,
         # never the same day as disbursement. Each subsequent default follows the
@@ -228,12 +270,18 @@ with st.sidebar.expander("💰 Add Monthly Payment", expanded=True):
                         f"({format_inr(already_paid_this_month)}). Cannot log another full payment for this month."
                     )
                 else:
-                    st.session_state.accounts[pay_id]["history"].append({
-                        "month_date": month_date,
-                        "amount_paid": amount_paid,
-                    })
-                    st.success("Payment recorded")
-                    st.rerun()  # forces the date field to re-initialize immediately with the new next-month default
+                    try:
+                        database.add_payment(pay_id, month_date, amount_paid)
+                    except sqlite3.IntegrityError:
+                        # Backup for the already_paid_this_month check above —
+                        # payments has UNIQUE(account_id, month_date), so the
+                        # database itself refuses a second row for the same month.
+                        st.error(
+                            f"⚠️ {month_date.strftime('%b %Y')} already has a payment logged for this account."
+                        )
+                    else:
+                        st.success("Payment recorded")
+                        st.rerun()  # forces the date field to re-initialize immediately with the new next-month default
     else:
         st.info("Create an account first")
 
@@ -243,12 +291,12 @@ st.title("PraSMA — Risk Dashboard")
 tab1, tab2 = st.tabs(["Account Detail", "Portfolio Risk List"])
 
 with tab1:
-    if not st.session_state.accounts:
+    if not all_account_ids:
         st.info("No accounts yet. Add one from the sidebar.")
     else:
         selected = st.session_state["active_account"]
         st.caption(f"Showing: **{selected}** (change via 🏦 Active Account in the sidebar)")
-        acc = st.session_state.accounts[selected]
+        acc = load_account(selected)
         snapshots, features, risk_pct, using_real_model = get_account_metrics(acc)
         dpd = snapshots[-1]["dpd"] if snapshots else 0
         stage = snapshots[-1]["stage"] if snapshots else "Standard"
@@ -355,7 +403,7 @@ with tab1:
             st.dataframe(hist_df, use_container_width=True)
 
 with tab2:
-    if not st.session_state.accounts:
+    if not all_account_ids:
         st.info("No accounts yet.")
     else:
         _, model_active_check = get_risk_score({f: 0 for f in FEATURE_ORDER})
@@ -364,7 +412,8 @@ with tab2:
             st.caption("⚠️ model.pkl not found — showing placeholder risk scores. Run train_model.py to enable the trained model.")
 
         rows = []
-        for acc_id, acc in st.session_state.accounts.items():
+        for acc_id in all_account_ids:
+            acc = load_account(acc_id)
             snapshots, features, risk_pct, _ = get_account_metrics(acc)
             dpd = snapshots[-1]["dpd"] if snapshots else 0
             stage = snapshots[-1]["stage"] if snapshots else "Standard"
